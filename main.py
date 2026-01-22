@@ -11,3 +11,12 @@ import warnings
 import logging
 from typing import Dict, List, Optional
 import socket
+
+
+st.title('CS425')
+
+app = st.container()
+
+with app:
+    st.header('Network Traffic Analyzer')
+    st.write('This application captures and analyzes network traffic in real-time.')
