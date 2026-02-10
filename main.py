@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
+#import plotly.express as px
+#import plotly.graph_objects as go
 from scapy.all import sniff, IP, TCP, UDP
 from scapy.layers.http import HTTPRequest
 from collections import defaultdict
@@ -13,6 +13,9 @@ import threading
 import socket
 import logging
 from typing import Dict, Optional
+from scapy.arch.windows import get_windows_if_list
+
+
 
 class PacketProcessor:
     def __init__(self):
@@ -129,7 +132,7 @@ class PacketProcessor:
 def display_stats(processor: PacketProcessor):
     stats = processor.get_stats()
     if not stats:
-        st.info("No packets captured yet.")
+        print("No packets captured yet.")
         return
 
     # Convert stats dict to DataFrame
@@ -148,9 +151,9 @@ def display_stats(processor: PacketProcessor):
             "Last Seen": data["last_seen"]
         })
     df = pd.DataFrame(rows)
+    #print(df.to_string(index=False))
+    #print("-" * 80)
 
-    st.subheader("Packet Stats Table")
-    st.dataframe(df)
 
 def real_time_packets(processor: PacketProcessor, interface: Optional[str] = None):
     def capture_packets():
@@ -159,7 +162,7 @@ def real_time_packets(processor: PacketProcessor, interface: Optional[str] = Non
         except Exception as e:
             logging.error(f"Packet capture thread error: {e}")
     try:
-        thread = threading.Thread(target=capture_packets, daemon=True)
+        thread = threading.Thread(target=capture_packets, daemon=True, args=(stop_event))
         thread.start()
         logging.info("Packet capture thread started")
         return thread
@@ -168,23 +171,77 @@ def real_time_packets(processor: PacketProcessor, interface: Optional[str] = Non
         return None
 
 
-def main():
-    st.title('CS425 - Network Traffic Analyzer')
-    st.write('This application captures and analyzes network traffic in real-time.')
+def stop_capture(stop_event):
+    while not stop_event.is_set():
+        pass
+    st.info("Stopping packet capture...")
 
+stop_event = threading.Event()
+
+def main():
     # Initialize processor and thread
     if 'processor' not in st.session_state:
         st.session_state.processor = PacketProcessor()
-        capture_thread = real_time_packets(st.session_state.processor, interface="Wi-Fi")
+        capture_thread = real_time_packets(st.session_state.processor, interface="\\Device\\NPF_{8D796711-983F-45B8-9A75-BD014D11E8D8}")
         st.session_state.capture_thread = capture_thread
         st.session_state.start_time = time.time()
-        if capture_thread is None or not capture_thread.is_alive():
-            st.warning("Packet capture may not be running. On Windows, ensure Streamlit runs as admin and NPCAP is installed.")
-        else:
-            st.success("Packet capture started (running in background thread).")
-    
-    # Display stats
-    display_stats(st.session_state.processor)
 
-if __name__ == '__main__':
+        if st.session_state.capture_thread is None or not st.session_state.capture_thread.is_alive():
+            st.warning("[WARNING] Packet capture may not be running.")
+            st.info("On Windows, ensure the script is run as administrator and NPCAP is installed.")
+        else:
+            st.success("[INFO] Packet capture started (running in background thread).")
+
+
+    try:
+        # Periodically display stats
+        while True:
+            '''
+            interfaces = get_windows_if_list()
+            for iface in interfaces:
+                print(f"Name: {iface['name']}")
+                print(f"Description: {iface['description']}")
+                print(f"NPF Device: \\\\Device\\\\NPF_{iface['guid']}")
+                print("-" * 60)
+            '''
+            display_stats(st.session_state.processor)
+            time.sleep(2)  # adjust refresh rate as needed
+    except KeyboardInterrupt:
+        st.info("\n[INFO] Stopping packet capture...")
+        st.info(f"[INFO] Runtime: {time.time() - st.session_state.start_time:.2f} seconds")
+
+st.title("Real-Time Network Traffic Analyzer")
+app = st.container()
+
+with app:
+    st.header("Live Network Traffic Stats")
+    st.write("Capturing packets in real-time and displaying aggregated stats per source IP.")
+    
+    packets, time = st.columns(2)
+    
+    df = st.session_state.processor.display_stats()
+    
+    with packets:
+        st.metric("Total Packets", len(df))
+        
+    with time:
+        if 'start_time' in st.session_state:
+            duration = time.time() - st.session_state.start_time
+            st.metric("Capture Time", f"{duration:.2f} seconds")
+            
+    st.subheader("Recent Stats")
+    
+    if not df.empty:
+        st.dataframe(df)
+    else:
+        st.write("No packets captured yet. Please wait...")
+
+if st.button("Stop Capture"):
+    st.info("Stopping packet capture...")
+    stop_event.set()
+    st.session_state.capture_thread.join()
+    st.info(f"Capture stopped. Total runtime: {time.time() - st.session_state.start_time:.2f} seconds")
+        
+
+if __name__ == "__main__":
     main()
