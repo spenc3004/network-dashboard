@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 
 WIFI_TOKENS = ("wi-fi", "wifi", "wireless", "wlan", "802.11", "airport")
 # RUN WITH PRIVILEGES:
-# - Windows: Run as Administrator and ensure Npcap is installed.
+# - Windows: Run as Administrator and ensure Npcap is installed.  [streamlit run main.py]
 # - Mac: Run with sudo or grant permissions to capture packets.  [sudo -E venv/bin/streamlit run main.py]
 
 class PacketProcessor:
@@ -377,7 +377,7 @@ with duration_col:
 
 st.subheader("Recent Stats")
 if not stats_df.empty:
-    st.dataframe(stats_df, use_container_width=True)
+    st.dataframe(stats_df , width="stretch")
     st.success("Stats updated successfully.")
 else:
     st.info("No packets captured yet. Please wait...")
