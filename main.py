@@ -1,52 +1,68 @@
-import streamlit as st
-import pandas as pd
-#import plotly.express as px
-#import plotly.graph_objects as go
-from scapy.all import sniff, IP, TCP, UDP
-from scapy.layers.http import HTTPRequest
-from collections import defaultdict
-import time
-from datetime import datetime
-import warnings
-from typing import Dict, List, Optional
-import threading
-import socket
 import logging
-from typing import Dict, Optional
-from scapy.arch.windows import get_windows_if_list
+import platform
+import socket
+import subprocess
+import threading
+import time
+from collections import defaultdict
+from datetime import datetime
+from typing import Dict, List, Optional
 
+import pandas as pd
+import streamlit as st
+from streamlit_autorefresh import st_autorefresh
+from scapy.all import IP, TCP, UDP, conf, get_if_addr, get_if_list, sniff
 
+try:
+    from scapy.arch.windows import get_windows_if_list
+except Exception:  # pragma: no cover - best-effort on non-Windows
+    get_windows_if_list = None
+
+logging.basicConfig(level=logging.INFO)
+
+WIFI_TOKENS = ("wi-fi", "wifi", "wireless", "wlan", "802.11", "airport")
+# RUN WITH PRIVILEGES:
+# - Windows: Run as Administrator and ensure Npcap is installed.
+# - Mac: Run with sudo or grant permissions to capture packets.  [sudo -E venv/bin/streamlit run main.py]
 
 class PacketProcessor:
     def __init__(self):
         self.protocol_map = {
-            1: 'ICMP',
-            6: 'TCP',
-            17: 'UDP',
+            1: "ICMP",
+            6: "TCP",
+            17: "UDP",
         }
-        # Thread-safe dictionary to store stats per source IP
-        self.stats = defaultdict(lambda: {
-            "packet_count": 0,
-            "dst_ips": set(),
-            "dst_ports": set(),
-            "protocols": set(),
-            "bytes": 0,
-            "first_seen": None,
-            "last_seen": None,
-            "tcp_flags": set(),
-            "tcp_packets": 0
-        })
+        self.stats = defaultdict(
+            lambda: {
+                "packet_count": 0,
+                "dst_ips": set(),
+                "dst_ports": set(),
+                "protocols": set(),
+                "bytes": 0,
+                "first_seen": None,
+                "last_seen": None,
+                "tcp_flags": set(),
+                "tcp_packets": 0,
+            }
+        )
         self.lock = threading.Lock()
         self.ip_cache: Dict[str, str] = {}
         self.port_map: Dict[int, str] = {
-            80: 'HTTP', 443: 'HTTPS', 53: 'DNS', 22: 'SSH',
-            25: 'SMTP', 110: 'POP3', 143: 'IMAP', 3306: 'MySQL',
-            5432: 'Postgres', 8080: 'HTTP-Alt',
+            80: "HTTP",
+            443: "HTTPS",
+            53: "DNS",
+            22: "SSH",
+            25: "SMTP",
+            110: "POP3",
+            143: "IMAP",
+            3306: "MySQL",
+            5432: "Postgres",
+            8080: "HTTP-Alt",
         }
 
     def resolve_name(self, ip: str) -> str:
         if not ip:
-            return ''
+            return ""
         if ip in self.ip_cache:
             return self.ip_cache[ip]
         try:
@@ -57,10 +73,12 @@ class PacketProcessor:
         return name
 
     def get_protocol_name(self, proto_num: int) -> str:
-        return self.protocol_map.get(proto_num, f'OTHER({proto_num})')
+        return self.protocol_map.get(proto_num, f"OTHER({proto_num})")
 
-    def get_application(self, protocol_name: str, src_port: Optional[int], dst_port: Optional[int]) -> Optional[str]:
-        if protocol_name not in ['TCP', 'UDP']:
+    def get_application(
+        self, protocol_name: str, src_port: Optional[int], dst_port: Optional[int]
+    ) -> Optional[str]:
+        if protocol_name not in ["TCP", "UDP"]:
             return None
         if src_port and src_port in self.port_map:
             return self.port_map[src_port]
@@ -80,9 +98,8 @@ class PacketProcessor:
             protocol_name = self.get_protocol_name(protocol_num)
             timestamp = datetime.fromtimestamp(packet.time)
             src_port = dst_port = None
-            application = None
 
-            if protocol_name == 'TCP' and packet.haslayer(TCP):
+            if protocol_name == "TCP" and packet.haslayer(TCP):
                 tcp_layer = packet[TCP]
                 src_port = tcp_layer.sport
                 dst_port = tcp_layer.dport
@@ -90,12 +107,12 @@ class PacketProcessor:
             else:
                 flags = None
 
-            if protocol_name == 'UDP' and packet.haslayer(UDP):
+            if protocol_name == "UDP" and packet.haslayer(UDP):
                 udp_layer = packet[UDP]
                 src_port = udp_layer.sport
                 dst_port = udp_layer.dport
 
-            application = self.get_application(protocol_name, src_port, dst_port)
+            _ = self.get_application(protocol_name, src_port, dst_port)
 
             with self.lock:
                 stat = self.stats[src_ip]
@@ -105,18 +122,17 @@ class PacketProcessor:
                 stat["protocols"].add(protocol_name)
                 if dst_port:
                     stat["dst_ports"].add(dst_port)
-                if protocol_name == 'TCP' and flags:
+                if protocol_name == "TCP" and flags:
                     stat["tcp_flags"].add(flags)
                     stat["tcp_packets"] += 1
                 if stat["first_seen"] is None:
                     stat["first_seen"] = timestamp
                 stat["last_seen"] = timestamp
 
-        except Exception as e:
-            logging.error(f"Error processing packet: {e}")
+        except Exception as exc:
+            logging.error("Error processing packet: %s", exc)
 
     def get_stats(self):
-        # Convert sets to lists for easier serialization
         result = {}
         with self.lock:
             for ip, stat in self.stats.items():
@@ -128,120 +144,259 @@ class PacketProcessor:
                     "tcp_flags": list(stat["tcp_flags"]),
                 }
         return result
-    
-def display_stats(processor: PacketProcessor):
-    stats = processor.get_stats()
-    if not stats:
-        print("No packets captured yet.")
-        return
 
-    # Convert stats dict to DataFrame
+
+def _is_non_loopback_ipv4(ip: Optional[str]) -> bool:
+    if not ip:
+        return False
+    if ip.startswith("127."):
+        return False
+    if ip.startswith("169.254."):
+        return False
+    return True
+
+
+def _windows_iface_ips(iface: dict) -> List[str]:
+    for key in ("ips", "ipv4", "ip"):
+        value = iface.get(key)
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _score_windows_iface(iface: dict) -> int:
+    name = (iface.get("name") or "").lower()
+    desc = (iface.get("description") or "").lower()
+    text = f"{name} {desc}"
+
+    score = 0
+    if any(token in text for token in WIFI_TOKENS):
+        score += 5
+    if any(_is_non_loopback_ipv4(ip) for ip in _windows_iface_ips(iface)):
+        score += 2
+    if any(token in text for token in ("virtual", "loopback", "tunnel")):
+        score -= 5
+    return score
+
+
+def _format_windows_npf(guid: str) -> str:
+    if guid.startswith("{") and guid.endswith("}"):
+        return f"\\Device\\NPF_{guid}"
+    return f"\\Device\\NPF_{{{guid}}}"
+
+
+def _find_wifi_interface_windows() -> Optional[str]:
+    if get_windows_if_list is None:
+        return None
+
+    interfaces = get_windows_if_list()
+    if not interfaces:
+        return None
+
+    best = max(interfaces, key=_score_windows_iface)
+    pcap_name = best.get("pcap_name") or best.get("name")
+    if isinstance(pcap_name, str) and pcap_name.lower().startswith("\\device\\npf_"):
+        return pcap_name
+
+    guid = best.get("guid")
+    if isinstance(guid, str) and guid:
+        return _format_windows_npf(guid)
+
+    return pcap_name if isinstance(pcap_name, str) else None
+
+
+def _find_wifi_interface_mac() -> Optional[str]:
+    try:
+        output = subprocess.check_output(
+            ["/usr/sbin/networksetup", "-listallhardwareports"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        current_port = None
+        for line in output.splitlines():
+            line = line.strip()
+            if line.startswith("Hardware Port:"):
+                current_port = line.split(":", 1)[1].strip().lower()
+            elif line.startswith("Device:") and current_port:
+                device = line.split(":", 1)[1].strip()
+                if current_port in ("wi-fi", "airport"):
+                    return device
+    except Exception:
+        pass
+
+    for iface in get_if_list():
+        if not iface.startswith("en"):
+            continue
+        try:
+            ip = get_if_addr(iface)
+        except Exception:
+            continue
+        if _is_non_loopback_ipv4(ip):
+            return iface
+
+    try:
+        if conf.iface:
+            ip = get_if_addr(conf.iface)
+            if _is_non_loopback_ipv4(ip):
+                return conf.iface
+    except Exception:
+        pass
+
+    return None
+
+
+def find_wifi_interface() -> Optional[str]:
+    system = platform.system()
+    if system == "Windows":
+        return _find_wifi_interface_windows()
+    if system == "Darwin":
+        return _find_wifi_interface_mac()
+
+    for iface in get_if_list():
+        try:
+            ip = get_if_addr(iface)
+        except Exception:
+            continue
+        if _is_non_loopback_ipv4(ip):
+            return iface
+    return None
+
+
+def stats_to_dataframe(processor: PacketProcessor) -> pd.DataFrame:
+    stats = processor.get_stats()
     rows = []
     for src_ip, data in stats.items():
-        rows.append({
-            "Source IP": src_ip,
-            "Packets": data["packet_count"],
-            "Bytes": data["bytes"],
-            "TCP Packets": data["tcp_packets"],
-            "Dest IPs": ", ".join(data["dst_ips"]),
-            "Dest Ports": ", ".join(map(str, data["dst_ports"])),
-            "Protocols": ", ".join(data["protocols"]),
-            "TCP Flags": ", ".join(data["tcp_flags"]),
-            "First Seen": data["first_seen"],
-            "Last Seen": data["last_seen"]
-        })
+        rows.append(
+            {
+                "Source IP": src_ip,
+                "Packets": data["packet_count"],
+                "Bytes": data["bytes"],
+                "TCP Packets": data["tcp_packets"],
+                "Dest IPs": ", ".join(data["dst_ips"]),
+                "Dest Ports": ", ".join(map(str, data["dst_ports"])),
+                "Protocols": ", ".join(data["protocols"]),
+                "TCP Flags": ", ".join(data["tcp_flags"]),
+                "First Seen": data["first_seen"],
+                "Last Seen": data["last_seen"],
+            }
+        )
     df = pd.DataFrame(rows)
-    #print(df.to_string(index=False))
-    #print("-" * 80)
+    if not df.empty:
+        df.sort_values("Packets", ascending=False, inplace=True)
+    return df
 
 
-def real_time_packets(processor: PacketProcessor, interface: Optional[str] = None):
-    def capture_packets():
+def real_time_packets(
+    processor: PacketProcessor,
+    stop_event: threading.Event,
+    interface: Optional[str] = None,
+) -> Optional[threading.Thread]:
+    def capture_loop():
         try:
-            sniff(prn=processor.process_packet, iface=interface, store=False)
-        except Exception as e:
-            logging.error(f"Packet capture thread error: {e}")
+            while not stop_event.is_set():
+                sniff(
+                    prn=processor.process_packet,
+                    iface=interface,
+                    store=False,
+                    timeout=1,
+                )
+        except Exception as exc:
+            logging.error("Packet capture thread error: %s", exc)
+
     try:
-        thread = threading.Thread(target=capture_packets, daemon=True, args=(stop_event))
+        thread = threading.Thread(target=capture_loop, daemon=True)
         thread.start()
         logging.info("Packet capture thread started")
         return thread
-    except Exception as e:
-        logging.error(f"Failed to start packet capture thread: {e}")
+    except Exception as exc:
+        logging.error("Failed to start packet capture thread: %s", exc)
         return None
 
 
-def stop_capture(stop_event):
-    while not stop_event.is_set():
-        pass
-    st.info("Stopping packet capture...")
-
-stop_event = threading.Event()
-
-def main():
-    # Initialize processor and thread
-    if 'processor' not in st.session_state:
+def ensure_state_initialized() -> None:
+    if "processor" not in st.session_state:
         st.session_state.processor = PacketProcessor()
-        capture_thread = real_time_packets(st.session_state.processor, interface="\\Device\\NPF_{8D796711-983F-45B8-9A75-BD014D11E8D8}")
-        st.session_state.capture_thread = capture_thread
-        st.session_state.start_time = time.time()
-
-        if st.session_state.capture_thread is None or not st.session_state.capture_thread.is_alive():
-            st.warning("[WARNING] Packet capture may not be running.")
-            st.info("On Windows, ensure the script is run as administrator and NPCAP is installed.")
-        else:
-            st.success("[INFO] Packet capture started (running in background thread).")
+    if "stop_event" not in st.session_state:
+        st.session_state.stop_event = threading.Event()
+    if "capture_enabled" not in st.session_state:
+        st.session_state.capture_enabled = True
 
 
-    try:
-        # Periodically display stats
-        while True:
-            '''
-            interfaces = get_windows_if_list()
-            for iface in interfaces:
-                print(f"Name: {iface['name']}")
-                print(f"Description: {iface['description']}")
-                print(f"NPF Device: \\\\Device\\\\NPF_{iface['guid']}")
-                print("-" * 60)
-            '''
-            display_stats(st.session_state.processor)
-            time.sleep(2)  # adjust refresh rate as needed
-    except KeyboardInterrupt:
-        st.info("\n[INFO] Stopping packet capture...")
-        st.info(f"[INFO] Runtime: {time.time() - st.session_state.start_time:.2f} seconds")
+def ensure_capture_running() -> None:
+    ensure_state_initialized()
+
+    if not st.session_state.capture_enabled:
+        return
+
+    thread = st.session_state.get("capture_thread")
+    if thread is not None and thread.is_alive():
+        return
+
+    st.session_state.stop_event.clear()
+    interface = find_wifi_interface()
+    st.session_state.capture_interface = interface
+    st.session_state.capture_thread = real_time_packets(
+        st.session_state.processor,
+        stop_event=st.session_state.stop_event,
+        interface=interface,
+    )
+    st.session_state.start_time = time.time()
+
 
 st.title("Real-Time Network Traffic Analyzer")
-app = st.container()
 
-with app:
-    st.header("Live Network Traffic Stats")
-    st.write("Capturing packets in real-time and displaying aggregated stats per source IP.")
-    
-    packets, time = st.columns(2)
-    
-    df = st.session_state.processor.display_stats()
-    
-    with packets:
-        st.metric("Total Packets", len(df))
-        
-    with time:
-        if 'start_time' in st.session_state:
-            duration = time.time() - st.session_state.start_time
-            st.metric("Capture Time", f"{duration:.2f} seconds")
-            
-    st.subheader("Recent Stats")
-    
-    if not df.empty:
-        st.dataframe(df)
-    else:
-        st.write("No packets captured yet. Please wait...")
+ensure_capture_running()
 
-if st.button("Stop Capture"):
-    st.info("Stopping packet capture...")
-    stop_event.set()
-    st.session_state.capture_thread.join()
-    st.info(f"Capture stopped. Total runtime: {time.time() - st.session_state.start_time:.2f} seconds")
-        
+st.header("Live Network Traffic Stats")
+st.write("Capturing packets in real-time and displaying aggregated stats per source IP.")
 
-if __name__ == "__main__":
-    main()
+interface_label = st.session_state.get("capture_interface")
+if interface_label:
+    st.caption(f"Capturing on interface: {interface_label}")
+else:
+    st.warning("Wi-Fi interface not detected. Using default interface if available.")
+
+thread = st.session_state.get("capture_thread")
+if thread is None or not thread.is_alive():
+    st.warning("Packet capture thread is not running.")
+    st.info("On Windows, run as Administrator and ensure Npcap is installed.")
+
+stats_df = stats_to_dataframe(st.session_state.processor)
+
+total_packets = int(stats_df["Packets"].sum()) if not stats_df.empty else 0
+
+packets_col, duration_col = st.columns(2)
+with packets_col:
+    st.metric("Total Packets", total_packets)
+with duration_col:
+    if "start_time" in st.session_state:
+        duration = time.time() - st.session_state.start_time
+        st.metric("Capture Time", f"{duration:.2f} seconds")
+
+st.subheader("Recent Stats")
+if not stats_df.empty:
+    st.dataframe(stats_df, use_container_width=True)
+    st.success("Stats updated successfully.")
+else:
+    st.info("No packets captured yet. Please wait...")
+
+start, stop = st.columns(2)
+with start:
+    if st.button("Start Capture"):
+        st.session_state.capture_enabled = True
+        ensure_capture_running()
+        st.rerun()
+with stop:
+    if st.button("Stop Capture"):
+        st.session_state.capture_enabled = False
+        st.session_state.stop_event.set()
+        thread = st.session_state.get("capture_thread")
+        if thread is not None:
+            thread.join(timeout=2)
+        st.info("Capture stopped.")
+
+st.caption("Auto-refreshes every 2 seconds while running.")
+if st.session_state.get("capture_enabled", True):
+    count = st_autorefresh(interval=2000, limit=100, key="autorefresh")
