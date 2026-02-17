@@ -36,6 +36,7 @@ class PacketProcessor:
             lambda: {
                 "packet_count": 0,
                 "dst_ips": set(),
+                "dst_names": set(),
                 "dst_ports": set(),
                 "protocols": set(),
                 "bytes": 0,
@@ -43,6 +44,7 @@ class PacketProcessor:
                 "last_seen": None,
                 "tcp_flags": set(),
                 "tcp_packets": 0,
+                "src_name": "",
             }
         )
         self.lock = threading.Lock()
@@ -94,6 +96,8 @@ class PacketProcessor:
             ip_layer = packet[IP]
             src_ip = ip_layer.src
             dst_ip = ip_layer.dst
+            src_name = self.resolve_name(src_ip)
+            dst_name = self.resolve_name(dst_ip)
             protocol_num = ip_layer.proto
             protocol_name = self.get_protocol_name(protocol_num)
             timestamp = datetime.fromtimestamp(packet.time)
@@ -116,8 +120,12 @@ class PacketProcessor:
 
             with self.lock:
                 stat = self.stats[src_ip]
+                if not stat["src_name"]:
+                    stat["src_name"] = src_name
+                stat.setdefault("dst_names", set())
                 stat["packet_count"] += 1
                 stat["dst_ips"].add(dst_ip)
+                stat["dst_names"].add(dst_name)
                 stat["bytes"] += len(packet)
                 stat["protocols"].add(protocol_name)
                 if dst_port:
@@ -138,10 +146,13 @@ class PacketProcessor:
             for ip, stat in self.stats.items():
                 result[ip] = {
                     **stat,
+                    "src_name": stat.get("src_name", ""),
                     "dst_ips": list(stat["dst_ips"]),
+                    "dst_names": list(stat.get("dst_names", set())),
                     "dst_ports": list(stat["dst_ports"]),
                     "protocols": list(stat["protocols"]),
                     "tcp_flags": list(stat["tcp_flags"]),
+                    
                 }
         return result
 
@@ -268,13 +279,29 @@ def stats_to_dataframe(processor: PacketProcessor) -> pd.DataFrame:
     stats = processor.get_stats()
     rows = []
     for src_ip, data in stats.items():
+        source_name = data.get("src_name", "")
+        if not source_name or source_name == src_ip:
+            source_name = "Source name couldn't be resolved"
+
+        unresolved_dest_msg = "Destination name couldn't be resolved"
+        dest_name_candidates = data.get("dst_names", [])
+        dest_ips = set(data.get("dst_ips", []))
+        display_dest_names = sorted(
+            {
+                unresolved_dest_msg if (not name or name in dest_ips) else name
+                for name in dest_name_candidates
+            }
+        )
+
         rows.append(
             {
                 "Source IP": src_ip,
+                "Source Name": source_name,
                 "Packets": data["packet_count"],
                 "Bytes": data["bytes"],
                 "TCP Packets": data["tcp_packets"],
                 "Dest IPs": ", ".join(data["dst_ips"]),
+                "Dest Names": ", ".join(display_dest_names),
                 "Dest Ports": ", ".join(map(str, data["dst_ports"])),
                 "Protocols": ", ".join(data["protocols"]),
                 "TCP Flags": ", ".join(data["tcp_flags"]),
