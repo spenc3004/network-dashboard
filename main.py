@@ -4,8 +4,8 @@ import socket
 import subprocess
 import threading
 import time
-from collections import defaultdict
-from datetime import datetime
+from collections import defaultdict, deque
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -156,6 +156,43 @@ class PacketProcessor:
                 }
         return result
 
+class PacketAnomalyDetector(PacketProcessor):
+    def __init__(self):
+        super().__init__()
+        self.anomalies = []
+        self.max_anomalies = 500
+        
+        #Recent activity tracking for anomaly detection
+        self.port_scan_window = defaultdict(lambda: deque())  
+
+        #Detection thresholds
+        self.PORT_SCAN_PORT_THRESHOLD = 10
+        self.PORT_SCAN_TIME_WINDOW = timedelta(seconds=60)
+        self.SMALL_PACKET_SIZE_THRESHOLD = 120  # bytes
+
+
+        
+
+
+    def analyze_packet(self, packet) -> None:
+        super().process_packet(packet)
+        try:
+            if packet.haslayer(IP):
+                ip_layer = packet[IP]
+                if ip_layer.proto == 6 and packet.haslayer(TCP):
+                    tcp_layer = packet[TCP]
+                    flags = str(tcp_layer.flags)
+                    if flags == "S":  # SYN scan
+                        self.anomalies.append(
+                            {
+                                "type": "SYN Scan",
+                                "src_ip": ip_layer.src,
+                                "dst_ip": ip_layer.dst,
+                                "timestamp": datetime.fromtimestamp(packet.time),
+                            }
+                        )
+        except Exception as exc:
+            logging.error("Error detecting anomalies: %s", exc)
 
 def _is_non_loopback_ipv4(ip: Optional[str]) -> bool:
     if not ip:
